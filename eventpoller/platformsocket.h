@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+#include <cstring>
+
 // ================================================================
 //  平台差异全部隔离在这一个头文件里
 //  上层代码只包含这个文件，不直接写 #ifdef _WIN32
@@ -15,8 +18,10 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>    // LPFN_CONNECTEX / WSAID_CONNECTEX 在这里声明
 #include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "mswsock.lib")
 
 // Windows 用 SOCKET 类型，Linux 用 int
 // 统一用 sock_t
@@ -93,6 +98,19 @@ struct WsaInit {
     ~WsaInit() { WSACleanup(); }
 };
 
+// ── ConnectEx 函数指针：必须运行时通过 WSAIoctl 获取 ─────────────
+// ConnectEx 不在 ws2_32.lib 的导出表里，是 Winsock 扩展函数，
+// 必须先创建一个 socket，再用 WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER) 查询。
+// 用 IOCP 发起异步 connect 必须用 ConnectEx（普通 connect 不支持 OVERLAPPED）。
+inline LPFN_CONNECTEX getConnectExPtr(sock_t fd) {
+    GUID guid = WSAID_CONNECTEX;
+    LPFN_CONNECTEX fn = nullptr;
+    DWORD bytes = 0;
+    WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        &guid, sizeof(guid), &fn, sizeof(fn), &bytes, nullptr, nullptr);
+    return fn;
+}
+
 #else
 // ── Linux / macOS ────────────────────────────────────────────────
 #include <unistd.h>
@@ -100,6 +118,7 @@ struct WsaInit {
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <cerrno>
 
 using sock_t = int;
@@ -136,3 +155,39 @@ inline void pipeClose(sock_t fd) { close(fd); }
 struct WsaInit {};
 
 #endif // _WIN32
+
+// ================================================================
+//  以下函数两个平台通用：用 sockaddr_in / inet_pton 等标准 BSD socket API
+//  Windows 和 Linux 这部分接口完全一致，不需要 #ifdef
+// ================================================================
+
+// 域名/IP 字符串 → sockaddr_in。支持直接传IP，也支持域名（内部走getaddrinfo）
+inline bool resolveAddress(const std::string& host, uint16_t port, sockaddr_in& out) {
+    memset(&out, 0, sizeof(out));
+    out.sin_family = AF_INET;
+    out.sin_port = htons(port);
+
+    // 先尝试当成纯IP解析（最常见情况，不需要DNS查询）
+    if (inet_pton(AF_INET, host.c_str(), &out.sin_addr) == 1) {
+        return true;
+    }
+
+    // 不是纯IP，走域名解析
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || !result) {
+        return false;
+    }
+    out.sin_addr = ((sockaddr_in*)result->ai_addr)->sin_addr;
+    freeaddrinfo(result);
+    return true;
+}
+
+// 创建一个非阻塞 TCP socket
+inline sock_t createTcpSocket() {
+    sock_t fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd != INVALID_SOCK) setNonBlock(fd);
+    return fd;
+}

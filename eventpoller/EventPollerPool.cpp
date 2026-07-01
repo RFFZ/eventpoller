@@ -10,14 +10,14 @@ EventPollerPool& EventPollerPool::Instance() {
 
 // ── 构造：创建 N 个 EventPoller 并全部启动 ───────────────────────
 EventPollerPool::EventPollerPool(size_t pool_size) {
-    /*
-    * size_t n = pool_size;
-    if (n == 0) {
+    size_t n = pool_size;
+   /*
+   * if (n == 0) {
         n = std::thread::hardware_concurrency();
         if (n == 0) n = 4;   // 极端情况下 hardware_concurrency 返回0，兜底
     }
-    */
-    size_t n = 5;
+   */ 
+
     std::cout << "[EventPollerPool] creating " << n << " pollers\n";
 
     _pollers.reserve(n);

@@ -110,6 +110,10 @@ private:
     void runLoop();
     void wakeup();
     void flushTasks();
+    // 专供 doDelay/doRepeat 使用：和 async() 区别在于无条件 wakeup()，
+    // 因为插入新定时器会改变下一次 epoll_wait/GetQueuedCompletionStatus 该等多久，
+    // 哪怕调用方已经身处 poller 线程内部，也必须唤醒以便下一轮重新计算超时。
+    void asyncTimerTask(Task task);
 
     // ── 定时器内部逻辑 ───────────────────────────────────────────
     // 计算"距离最近一个未取消的定时器还有多少ms"，没有定时器时返回 -1(表示无限等待)
@@ -141,16 +145,29 @@ private:
     int _wake[2] = { -1, -1 };
 #else
     // ── Windows: IOCP ─────────────────────────────────────────────
-    enum class OpType { Recv, Send, Wake };
+    enum class OpType { Recv, Send, Connect, Wake };
+
+    // Connect 完成回调：ok=true 连接成功，ok=false 连接失败（含错误码）
+    using ConnectCallback = std::function<void(bool ok, int err_code)>;
 
     struct IoContext : OVERLAPPED {
-        OpType     type;
-        sock_t     fd;
-        WSABUF     wsabuf;
-        IoCallback cb;
+        OpType         type;
+        sock_t         fd;
+        WSABUF         wsabuf;
+        IoCallback     cb;          // Recv/Send 用
+        ConnectCallback conn_cb;    // Connect 用
     };
 
     HANDLE     _iocp = nullptr;
     IoContext* _wake_ctx = nullptr;
+
+public:
+    // ── IOCP 连接接口 ────────────────────────────────────────────
+    // 发起异步连接（内部使用 ConnectEx）。
+    // fd 必须先 bind 一个本地地址，且已经 associateSocket 到本 IOCP。
+    // 连接完成（成功或失败）后通过 cb 回调通知，回调在 IOCP 线程里执行。
+    bool postConnect(sock_t fd, const sockaddr_in& addr, ConnectCallback cb);
+
+private:
 #endif
 };

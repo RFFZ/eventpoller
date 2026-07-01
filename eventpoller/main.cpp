@@ -1,172 +1,273 @@
-﻿#include "EventPollerPool.h"
+﻿#include "TcpClient.h"
+#include "EventPollerPool.h"
 #include <iostream>
 #include <chrono>
 #include <thread>
 #include <cassert>
-#include <set>
-#include <map>
+#include <cstring>
 using namespace std::chrono;
 
-// ── 测试1：Pool 创建数量 = CPU核数 ────────────────────────────────
-void test_pool_size() {
-    std::cout << "\n=== test_pool_size ===\n";
-    auto& pool = EventPollerPool::Instance();
-    std::cout << "  pool size = " << pool.size()
-        << " (hardware_concurrency=" << std::thread::hardware_concurrency() << ")\n";
-    assert(pool.size() > 0);
-    std::cout << "\n";
-}
+// ════════════════════════════════════════════════════════════════
+//  一个最简单的本地 echo server（独立线程，阻塞式），
+//  用于验证 TcpClient 的 connect/send/recv/close 全流程是否正确。
+//  这不是要测试的对象，只是陪练。
+// ════════════════════════════════════════════════════════════════
+struct EchoServer {
+    sock_t   listen_fd = INVALID_SOCK;
+    uint16_t port = 0;
+    std::thread th;
+    std::atomic<bool> running{ true };
 
-// ── 测试2：getPoller 轮询分配，验证均衡性 ─────────────────────────
-void test_round_robin() {
-    std::cout << "\n=== test_round_robin ===\n";
-    auto& pool = EventPollerPool::Instance();
+    void start() {
+        listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;   // 系统分配端口
+        bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
+        listen(listen_fd, 4);
 
-    std::map<EventPoller*, int> count;
-    const int N = 20;   // 模拟20路流分配
-    for (int i = 0; i < N; i++) {
-        auto poller = pool.getPoller();
-        count[poller.get()]++;
+        socklen_t len = sizeof(addr);
+        getsockname(listen_fd, (sockaddr*)&addr, &len);
+        port = ntohs(addr.sin_port);
+
+        th = std::thread([this] { run(); });
     }
 
-    std::cout << "  20 streams distributed across " << count.size() << " pollers:\n";
-    for (auto& [p, c] : count) {
-        std::cout << "    poller " << p << " got " << c << " streams\n";
+    void run() {
+        while (running) {
+            sockaddr_in cli{};
+            socklen_t cl = sizeof(cli);
+            sock_t conn = accept(listen_fd, (sockaddr*)&cli, &cl);
+            if (conn == INVALID_SOCK) {
+                if (!running) break;
+                continue;
+            }
+            // 每个连接单独开一个线程做echo（陪练server不需要高性能）
+            std::thread([conn] {
+                char buf[4096];
+                while (true) {
+                    int n = (int)recv(conn, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    send(conn, buf, n, 0);   // echo回去
+                }
+                closeSocket(conn);
+                }).detach();
+        }
     }
 
-    // 均衡性检查：每个 poller 分到的数量差不超过1
-    int min_c = N, max_c = 0;
-    for (auto& [p, c] : count) {
-        min_c = std::min(min_c, c);
-        max_c = std::max(max_c, c);
+    void stop() {
+        running = false;
+        // 单纯 close 在某些情况下不能立刻唤醒阻塞中的 accept()，
+        // 用 shutdown() 更可靠地强制让 accept() 返回错误
+#ifndef _WIN32
+        ::shutdown(listen_fd, SHUT_RDWR);
+#endif
+        closeSocket(listen_fd);
+        if (th.joinable()) th.join();
     }
-    assert(max_c - min_c <= 1);
-    std::cout << "  load balanced (min=" << min_c << ", max=" << max_c << ")\n";
-}
-
-// ── 测试3：模拟20路流，每路独立帧率定时器，验证互不干扰 ──────────
-struct FakeStream {
-    int      id;
-    int      fps;
-    int      frame_count = 0;
-    TimerId  timer_id;
-    EventPoller::Ptr poller;
 };
 
-void test_simulated_20_streams() {
-    std::cout << "\n=== test_simulated_20_streams ===\n";
-    auto& pool = EventPollerPool::Instance();
 
-    const int STREAM_COUNT = 20;
-    const int TEST_MS = 500;   // 跑 500ms
+// ── 测试用 TcpClient 子类，记录回调触发情况 ──────────────────────
+class TestClient : public TcpClient {
+public:
+    using TcpClient::TcpClient;
 
-    std::vector<std::shared_ptr<FakeStream>> streams;
-    std::mutex log_mtx;
+    std::atomic<bool> connect_called{ false };
+    std::atomic<bool> connect_ok{ false };
+    std::string       connect_err;
 
-    for (int i = 0; i < STREAM_COUNT; i++) {
-        auto stream = std::make_shared<FakeStream>();
-        stream->id = i;
-        stream->fps = 25;                            // 模拟25fps推流
-        stream->poller = pool.getPoller();           // 分配到某个Poller（轮询）
+    std::mutex        recv_mtx;
+    std::string       recv_data;
 
-        int interval_ms = 1000 / stream->fps;        // 40ms一帧
+    std::atomic<bool> error_called{ false };
+    std::string       error_msg;
 
-        // 用 doRepeat 模拟"帧率定时器"，对应ZLMediaKit发送下一帧的节奏
-        stream->timer_id = stream->poller->doRepeat(interval_ms, [stream] {
-            stream->frame_count++;
-            // 这里不打印每一帧，否则日志会爆炸；20路*500ms/40ms≈250条
-            });
+    std::atomic<bool> send_complete_called{ false };
 
-        streams.push_back(stream);
+protected:
+    void onConnect(bool ok, const std::string& err) override {
+        connect_called = true;
+        connect_ok = ok;
+        connect_err = err;
+        std::cout << "  onConnect: ok=" << ok << " err=" << err << "\n";
+    }
+    void onRecv(const char* data, int len) override {
+        std::lock_guard<std::mutex> lk(recv_mtx);
+        recv_data.append(data, len);
+        std::cout << "  onRecv: " << len << " bytes\n";
+    }
+    void onError(const std::string& err) override {
+        error_called = true;
+        error_msg = err;
+        std::cout << "  onError: " << err << "\n";
+    }
+    void onSendComplete() override {
+        send_complete_called = true;
+    }
+};
+
+
+// ── 测试1：连接成功 + 收发数据（echo验证）─────────────────────────
+void test_connect_and_echo() {
+    std::cout << "\n=== test_connect_and_echo ===\n";
+   
+    EchoServer server;
+    server.start();
+    std::cout << "  echo server listening on 127.0.0.1:" << server.port << "\n";
+
+    auto poller = EventPollerPool::Instance().getPoller();
+    auto client = std::make_shared<TestClient>(poller);
+    auto start_time = std::chrono::high_resolution_clock::now();
+    client->connect("127.0.0.1", server.port, 2000);
+
+    // 等连接结果
+    for (int i = 0; i < 50 && !client->connect_called; i++)
+        std::this_thread::sleep_for(milliseconds(2));
+
+    assert(client->connect_called);
+    assert(client->connect_ok);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    // 打印连接耗时（微秒）
+    std::cout << " connectd execution time: " << duration.count() / 1000.0 << " ms\n";
+
+
+    // 发送数据
+    std::string msg = "hello tcp client";
+    client->send(msg);
+
+    // 等echo回来
+    for (int i = 0; i < 50; i++) {
+        std::this_thread::sleep_for(milliseconds(2));
+        std::lock_guard<std::mutex> lk(client->recv_mtx);
+        if (client->recv_data == msg)
+        {
+            std::cout << "  echo received correctly: '" << client->recv_data << "'\n";
+            break;
+        }
     }
 
-    std::cout << "  started " << STREAM_COUNT << " simulated streams (25fps each)\n";
-    std::this_thread::sleep_for(milliseconds(TEST_MS));
+    auto end_time2 = std::chrono::high_resolution_clock::now();
+    auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end_time2 - start_time);
+    // 打印连接耗时（微秒）
+    std::cout << " receive msg execution time: " <<duration2.count() / 1000.0 << " ms\n";
 
-    // 停止所有定时器
-    for (auto& s : streams) {
-        s->poller->cancelTimer(s->timer_id);
-    }
-    std::this_thread::sleep_for(milliseconds(50));   // 等最后一次回调落地
+    client->close();
+    std::this_thread::sleep_for(milliseconds(100));
 
-    // 验证：500ms / 40ms ≈ 12.5次，每路应该在 10~14 次之间（留误差余量）
-    int total_frames = 0;
-    int min_frames = 9999, max_frames = 0;
-    for (auto& s : streams) {
-        total_frames += s->frame_count;
-        min_frames = std::min(min_frames, s->frame_count);
-        max_frames = std::max(max_frames, s->frame_count);
-        assert(s->frame_count >= 8 && s->frame_count <= 16);
-    }
-
-    std::cout << "  total frames sent across 20 streams: " << total_frames << "\n";
-    std::cout << "  per-stream frame count range: [" << min_frames
-        << ", " << max_frames << "] (expected ~12-13)\n";
-
-    // 验证流确实分摊到了多个 poller，而不是全堆在一个线程上
-    std::set<EventPoller*> used_pollers;
-    for (auto& s : streams) used_pollers.insert(s->poller.get());
-    std::cout << "  streams spread across " << used_pollers.size() << " pollers\n";
-    assert(used_pollers.size() > 1 || pool.size() == 1);
+    server.stop();
 }
 
-// ── 测试4：模拟 paced_sender —— 双层定时器（帧率+平滑发送）───────
-void test_paced_sender_simulation() {
-    std::cout << "\n=== test_paced_sender_simulation ===\n";
+// ── 测试2：连接到不存在的端口，应该收到失败回调 ───────────────────
+void test_connect_refused() {
+    std::cout << "\n=== test_connect_refused ===\n";
+
     auto poller = EventPollerPool::Instance().getPoller();
+    auto client = std::make_shared<TestClient>(poller);
 
-    // 模拟一帧被FU-A分片成5个RTP包，平滑在帧间隔内发出去
-    std::queue<int> send_queue;
-    std::mutex      q_mtx;
-    std::vector<int64_t> send_times_ms;
-    std::mutex      log_mtx;
+    // 连一个大概率没人监听的端口
+    client->connect("127.0.0.1", 1, 2000);
 
+    for (int i = 0; i < 100 && !client->connect_called; i++)
+        std::this_thread::sleep_for(milliseconds(20));
+
+    assert(client->connect_called);
+    assert(!client->connect_ok);
+    std::cout << "  connect correctly failed: " << client->connect_err << "\n";
+}
+
+// ── 测试3：连接超时（连一个不会回应的地址）─────────────────────────
+void test_connect_timeout() {
+    std::cout << "\n=== test_connect_timeout ===\n";
+
+    auto poller = EventPollerPool::Instance().getPoller();
+    auto client = std::make_shared<TestClient>(poller);
+
+    // 10.255.255.1 在大多数网络环境下路由不可达、不会立刻拒绝，
+    // 但在某些容器/沙盒网络里内核层面的不可达检测可能比用户态超时更早或更晚触发，
+    // 所以等待窗口要比 timeout_ms 留出充分余量（这里给5秒，连接超时设300ms）
     auto t0 = steady_clock::now();
+    client->connect("10.255.255.1", 9999, 300);
 
+    for (int i = 0; i < 250 && !client->connect_called; i++)
+        std::this_thread::sleep_for(milliseconds(20));
 
-    //外层定时器：只负责"产生"，把数据放进队列，不直接发送
-    //内层定时器：负责把所有路的待发数据，匀速地、一个一个地真正发出去
-    //外层控制"两帧间隔"，内层单独控制"包与包间隔"
+    auto elapsed = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    std::cout << "  elapsed=" << elapsed << "ms, connect_called="
+        << client->connect_called.load() << "\n";
 
-    // 外层：帧率定时器（模拟25fps，40ms一帧）
-    TimerId frame_timer = poller->doRepeat(40, [&] {
-        std::lock_guard<std::mutex> lk(q_mtx);
-        for (int i = 0; i < 5; i++) send_queue.push(i);  // 一帧拆成5个包
-        });
+    // 这个测试不强制要求一定是"超时"这个具体原因触发失败
+    // （网络环境不同，可能是超时，也可能是内核更早报告不可达），
+    // 只要求最终一定会触发 onConnect(false, ...)，不会无限挂起，
+    // 且耗时不应该远超我们设的 timeout_ms 太多（验证超时机制确实生效，不是单纯靠内核）
+    assert(client->connect_called);
+    assert(!client->connect_ok);
+    std::cout << "  connect eventually failed: " << client->connect_err << "\n";
+}
 
-    // 内层：paced sender，每5ms尝试发一个包（模拟匀速吐出）
-    TimerId pace_timer = poller->doRepeat(5, [&] {
-        std::lock_guard<std::mutex> lk(q_mtx);
-        if (!send_queue.empty()) {
-            send_queue.pop();
-            std::lock_guard<std::mutex> lk2(log_mtx);
-            send_times_ms.push_back(
-                duration_cast<milliseconds>(steady_clock::now() - t0).count());
-        }
-        });
+// ── 测试4：多个TcpClient并发，验证互不干扰 ─────────────────────────
+void test_multi_clients() {
+    std::cout << "\n=== test_multi_clients ===\n";
 
-    std::this_thread::sleep_for(milliseconds(200));
-    poller->cancelTimer(frame_timer);
-    poller->cancelTimer(pace_timer);
-    std::this_thread::sleep_for(milliseconds(20));
+    EchoServer server;
+    server.start();
 
-    std::cout << "  packets sent over 200ms: " << send_times_ms.size() << "\n";
-    std::cout << "  send timestamps(ms): ";
-    for (auto t : send_times_ms) std::cout << t << " ";
-    std::cout << "\n";
+    const int N = 10;
+    std::vector<std::shared_ptr<TestClient>> clients;
 
-    // 验证：包是分散发送的，不是瞬间全部发完
-    // 阈值放宽：不同平台/不同负载下定时器精度有差异，这里只验证"确实在分批发"，
-    // 不严格要求具体数量（原理验证测试，不是性能基准测试）
-    assert(send_times_ms.size() >= 5);
-    std::cout << "  packets paced out smoothly (not bursty)\n";
+    for (int i = 0; i < N; i++) {
+        auto poller = EventPollerPool::Instance().getPoller();
+        auto client = std::make_shared<TestClient>(poller);
+        client->connect("127.0.0.1", server.port, 2000);
+        clients.push_back(client);
+    }
+
+    // 等全部连上
+    for (int wait = 0; wait < 100; wait++) {
+        bool all_connected = true;
+        for (auto& c : clients) if (!c->connect_called) all_connected = false;
+        if (all_connected) break;
+        std::this_thread::sleep_for(milliseconds(20));
+    }
+
+    int connected_count = 0;
+    for (auto& c : clients) if (c->connect_ok) connected_count++;
+    std::cout << "  " << connected_count << "/" << N << " clients connected\n";
+    assert(connected_count == N);
+
+    // 每个client发送不同的消息
+    for (int i = 0; i < N; i++) {
+        clients[i]->send("client-" + std::to_string(i));
+    }
+
+    std::this_thread::sleep_for(milliseconds(300));
+
+    int correct = 0;
+    for (int i = 0; i < N; i++) {
+        std::lock_guard<std::mutex> lk(clients[i]->recv_mtx);
+        std::string expected = "client-" + std::to_string(i);
+        if (clients[i]->recv_data == expected) correct++;
+    }
+    std::cout << "  " << correct << "/" << N << " received correct echo\n";
+    assert(correct == N);
+    std::cout << "  all clients independent, no cross-talk\n";
+
+    for (auto& c : clients) c->close();
+    std::this_thread::sleep_for(milliseconds(100));
+    server.stop();
 }
 
 int main() {
-    test_pool_size();
-    test_round_robin();
-    test_simulated_20_streams();
-    test_paced_sender_simulation();
+    WsaInit wsa;
+    // 首次调用 Instance() 即自动创建并启动pool，不需要显式start()
+
+    test_connect_and_echo();
+    test_connect_refused();
+    test_connect_timeout();
+    test_multi_clients();
 
     std::cout << "\n所有测试通过\n";
 

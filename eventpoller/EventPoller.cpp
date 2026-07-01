@@ -73,6 +73,22 @@ uint64_t EventPoller::nowMs() {
 
 // doDelay/doRepeat/cancelTimer 都可能从任意线程调用，
 // 但 _timer_heap 只能在 poller 线程里访问，所以统一通过 async() 切换线程。
+//
+// 关键点：这里不能用普通的 async()（它在"已经是poller线程"时会跳过wakeup优化），
+// 因为新插入一个定时器，会改变"下一次epoll_wait该等多久"这个计算结果。
+// 如果当前正处于本轮 runLoop 内部（比如在某个fd回调里调用doDelay），
+// 本轮的 timeout 已经在循环开头算好了，新塞进来的定时器不会被本轮感知到，
+// 必须强制 wakeup() 让 epoll_wait/GetQueuedCompletionStatus 立刻返回一次，
+// 在下一轮循环开头重新计算 timeout，否则可能会一直等到原计划的-1(无限)或上一个超时值，
+// 错过这个新定时器该醒来的时间点。
+void EventPoller::asyncTimerTask(Task task) {
+    {
+        std::lock_guard<std::mutex> lk(_task_mtx);
+        _tasks.push(std::move(task));
+    }
+    wakeup();   // 无条件唤醒，不做"同线程跳过"优化
+}
+
 TimerId EventPoller::doDelay(uint64_t delay_ms, Task task) {
     TimerId id = _timer_id_gen.fetch_add(1);
     auto flag = std::make_shared<bool>(false);
@@ -84,7 +100,7 @@ TimerId EventPoller::doDelay(uint64_t delay_ms, Task task) {
     t.id = id;
     t.canceled = flag;
 
-    async([this, t = std::move(t), flag]() mutable {
+    asyncTimerTask([this, t = std::move(t), flag]() mutable {
         _timer_flags[t.id] = flag;
         _timer_heap.push(std::move(t));
     });
@@ -102,7 +118,7 @@ TimerId EventPoller::doRepeat(uint64_t interval_ms, Task task) {
     t.id = id;
     t.canceled = flag;
 
-    async([this, t = std::move(t), flag]() mutable {
+    asyncTimerTask([this, t = std::move(t), flag]() mutable {
         _timer_flags[t.id] = flag;
         _timer_heap.push(std::move(t));
     });
@@ -110,9 +126,10 @@ TimerId EventPoller::doRepeat(uint64_t interval_ms, Task task) {
 }
 
 void EventPoller::cancelTimer(TimerId id) {
-    // 直接在调用线程把 flag 置 true 即可，不需要切到 poller 线程，
-    // 因为 shared_ptr<bool> 的读写在这里只有 bool 赋值，没有线程安全问题
-    // （poller 线程只读这个 flag，不写）
+    // cancelTimer 不需要强制wakeup：取消操作只是把 flag 置 true，
+    // 不会让"原本不会醒"的 epoll_wait 变得"需要提前醒来"，
+    // 等到下一次自然唤醒(无论因为什么原因)时检查到flag已置位，直接跳过即可，
+    // 不影响正确性，只是may delay一点点清理时机，可以接受。
     async([this, id] {
         auto it = _timer_flags.find(id);
         if (it != _timer_flags.end()) {
@@ -238,7 +255,6 @@ bool EventPoller::postSend(sock_t fd, const char* buf, int len, IoCallback cb) {
     ZeroMemory(static_cast<OVERLAPPED*>(ctx), sizeof(OVERLAPPED));
     ctx->type = OpType::Send;
     ctx->fd = fd;
-    // WSASend 的 buf 是 char*，这里 const_cast 一下（不会被修改）
     ctx->wsabuf.buf = const_cast<char*>(buf);
     ctx->wsabuf.len = (ULONG)len;
     ctx->cb = std::move(cb);
@@ -254,15 +270,41 @@ bool EventPoller::postSend(sock_t fd, const char* buf, int len, IoCallback cb) {
     return true;
 }
 
+// ── postConnect：投递一次异步连接（ConnectEx）──────────────────────
+// ConnectEx 要求 fd 必须已经 bind 本地地址、且已经 associateSocket 到本 IOCP。
+// 完成后 runLoop 收到 OpType::Connect 类型的完成包，走专属分支处理。
+bool EventPoller::postConnect(sock_t fd, const sockaddr_in& addr, ConnectCallback cb) {
+    // ConnectEx 不在 ws2_32.lib 导出表，必须运行时通过 WSAIoctl 获取函数指针
+    LPFN_CONNECTEX connectEx = getConnectExPtr(fd);
+    if (!connectEx) return false;
+
+    auto* ctx = new IoContext();
+    ZeroMemory(static_cast<OVERLAPPED*>(ctx), sizeof(OVERLAPPED));
+    ctx->type = OpType::Connect;
+    ctx->fd = fd;
+    ctx->conn_cb = std::move(cb);
+    // wsabuf 和 cb 字段对 Connect 无意义，保持零初始化即可
+
+    BOOL ok = connectEx(fd,
+        (const sockaddr*)&addr, sizeof(addr),
+        nullptr, 0,      // 不发送初始数据
+        nullptr,         // 发送字节数（异步模式下通过完成包获取）
+        static_cast<OVERLAPPED*>(ctx));
+
+    if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
+        delete ctx;
+        return false;
+    }
+    return true;
+}
+
 // ── runLoop：IOCP 主循环 ──────────────────────────────────────────
 void EventPoller::runLoop() {
     _thread_id = std::this_thread::get_id();
 
     while (_running) {
-        // 先处理到期定时器，顺便算出下次还要等多久
         int64_t delay = processTimersAndGetNextDelay();
-        // GetQueuedCompletionStatus 的超时是 DWORD(ms)，-1表示无限等待用INFINITE
-        DWORD wait_ms = (delay < 0) ? 1000   // 没有定时器时也最多等1秒，保证能及时退出
+        DWORD wait_ms = (delay < 0) ? 1000
             : (DWORD)std::min<int64_t>(delay, 1000);
 
         DWORD       bytes = 0;
@@ -273,26 +315,36 @@ void EventPoller::runLoop() {
             &overlapped, wait_ms);
 
         if (!ok && overlapped == nullptr) {
-            // 超时（没有任何完成包），回到循环开头重新计算定时器
-            continue;
+            continue;   // 超时，没有完成包
         }
 
         auto* ctx = static_cast<IoContext*>(overlapped);
         if (!ctx) continue;
 
         if (ctx->type == OpType::Wake) {
-            // 唤醒包，不携带真实数据，只用来跳出 GetQueuedCompletionStatus
             flushTasks();
             continue;
         }
 
-        // ── 处理真实 IO 完成 ─────────────────────────────────────
-        bool success = ok && bytes > 0;
+        // ── 按类型分发完成事件 ────────────────────────────────────
+        if (ctx->type == OpType::Connect) {
+            // ConnectEx 完成后必须调用 SO_UPDATE_CONNECT_CONTEXT，
+            // 否则 send/recv 等常规 API 无法在这个 socket 上正常工作
+            if (ok) {
+                setsockopt(ctx->fd, SOL_SOCKET,
+                    SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+            }
+            int err = ok ? 0 : (int)WSAGetLastError();
+            if (ctx->conn_cb) ctx->conn_cb(ok, err);
 
-        if (ctx->type == OpType::Recv) {
+        }
+        else if (ctx->type == OpType::Recv) {
+            bool success = ok && bytes > 0;
             if (ctx->cb) ctx->cb(success, ctx->wsabuf.buf, (int)bytes);
+
         }
         else if (ctx->type == OpType::Send) {
+            bool success = ok;
             if (ctx->cb) ctx->cb(success, nullptr, (int)bytes);
         }
 

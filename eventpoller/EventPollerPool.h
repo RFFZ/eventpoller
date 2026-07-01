@@ -46,7 +46,7 @@ public:
 private:
     // 私有构造：池子在首次 Instance() 调用时创建
     // pool_size=0 表示自动取 CPU 核数
-    explicit EventPollerPool(size_t pool_size = 0);
+    explicit EventPollerPool(size_t pool_size = 4);
     ~EventPollerPool();
 
     std::vector<EventPoller::Ptr> _pollers;
